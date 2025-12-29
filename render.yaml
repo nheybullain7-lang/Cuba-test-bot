@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: cuba-poker-bot
+    env: docker
+    plan: free
+    region: oregon
+    envVars:
+      - key: BOT_TOKEN
+        value: 8239308962:AAF8feXX76N6Pz77pgZozvWdH5J98lOm_2Q
