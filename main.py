@@ -1,6 +1,7 @@
 import os
 import logging
 import random
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import sqlite3
@@ -31,9 +32,14 @@ def init_db():
                   current_players INTEGER DEFAULT 1,
                   max_players INTEGER DEFAULT 2,
                   players TEXT DEFAULT '',
+                  player_names TEXT DEFAULT '',
                   deck TEXT DEFAULT '',
+                  community_cards TEXT DEFAULT '',
                   pot INTEGER DEFAULT 0,
-                  current_turn INTEGER DEFAULT 0)''')
+                  current_bet INTEGER DEFAULT 0,
+                  current_turn INTEGER DEFAULT 0,
+                  round TEXT DEFAULT 'preflop',
+                  bets TEXT DEFAULT '')''')
     conn.commit()
     conn.close()
 
@@ -76,65 +82,235 @@ async def registro_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     conn.close()
 
+# Función para mostrar mesa
+async def mostrar_mesa(room_id, context, mensaje_extra=""):
+    conn = sqlite3.connect('poker.db')
+    c = conn.cursor()
+    
+    c.execute("SELECT community_cards, pot, round, players, player_names FROM game_rooms WHERE room_id=?", (room_id,))
+    room = c.fetchone()
+    
+    if not room:
+        conn.close()
+        return
+    
+    community_cards = room[0] or ""
+    pot = room[1]
+    round_name = room[2]
+    players = room[3].split(',') if room[3] else []
+    player_names = room[4].split(',') if room[4] else []
+    
+    # Traducir nombre de ronda
+    rondas = {
+        'preflop': 'Pre-Flop',
+        'flop': 'Flop',
+        'turn': 'Turn',
+        'river': 'River',
+        'showdown': 'Showdown'
+    }
+    round_display = rondas.get(round_name, round_name)
+    
+    # Formatear cartas comunitarias
+    if community_cards:
+        cards_display = ' '.join(community_cards.split(','))
+    else:
+        cards_display = "---"
+    
+    mensaje = f"""
+🎰 **MESA DE POKER - {round_display}** 🎰
+
+💰 **Bote:** {pot} fichas
+🃏 **Cartas Comunitarias:** {cards_display}
+
+👥 **Jugadores:**
+"""
+    
+    for i, player_id in enumerate(players):
+        if i < len(player_names):
+            name = player_names[i]
+            mensaje += f"• {name}\n"
+    
+    if mensaje_extra:
+        mensaje += f"\n{mensaje_extra}"
+    
+    # Enviar a todos los jugadores
+    for player_id in players:
+        try:
+            keyboard = [
+                [InlineKeyboardButton("✅ Ver", callback_data=f"ver_{room_id}"),
+                 InlineKeyboardButton("📤 Apostar 10", callback_data=f"apostar_{room_id}_10"),
+                 InlineKeyboardButton("📤 Apostar 50", callback_data=f"apostar_{room_id}_50")],
+                [InlineKeyboardButton("🔄 Pasar", callback_data=f"pasar_{room_id}"),
+                 InlineKeyboardButton("🏳️ Retirarse", callback_data=f"retirarse_{room_id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await context.bot.send_message(
+                chat_id=int(player_id),
+                text=mensaje,
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Error enviando mensaje a {player_id}: {e}")
+    
+    conn.close()
+
+# Avanzar a siguiente ronda
+async def avanzar_ronda(room_id, context):
+    conn = sqlite3.connect('poker.db')
+    c = conn.cursor()
+    
+    c.execute("SELECT round, deck, players FROM game_rooms WHERE room_id=?", (room_id,))
+    room = c.fetchone()
+    
+    if not room:
+        conn.close()
+        return
+    
+    current_round = room[0]
+    deck_str = room[1] or ""
+    deck = deck_str.split(',') if deck_str else []
+    players = room[2].split(',') if room[2] else []
+    
+    new_round = current_round
+    community_cards = ""
+    
+    c.execute("SELECT community_cards FROM game_rooms WHERE room_id=?", (room_id,))
+    existing_cards = c.fetchone()[0] or ""
+    existing_list = existing_cards.split(',') if existing_cards else []
+    
+    # Determinar siguiente ronda y repartir cartas
+    if current_round == 'preflop' and len(deck) >= 3:
+        # Flop: 3 cartas
+        new_round = 'flop'
+        flop_cards = deck[:3]
+        community_cards = ','.join(flop_cards)
+        deck = deck[3:]
+        
+        mensaje = "🃏 **¡FLOP REPARTIDO!** 🃏\nTres cartas comunitarias."
+        
+    elif current_round == 'flop' and len(deck) >= 1:
+        # Turn: 1 carta
+        new_round = 'turn'
+        turn_card = deck[0]
+        community_cards = ','.join(existing_list + [turn_card])
+        deck = deck[1:]
+        
+        mensaje = "🃏 **¡TURN REPARTIDO!** 🃏\nCuarta carta comunitaria."
+        
+    elif current_round == 'turn' and len(deck) >= 1:
+        # River: 1 carta
+        new_round = 'river'
+        river_card = deck[0]
+        community_cards = ','.join(existing_list + [river_card])
+        deck = deck[1:]
+        
+        mensaje = "🃏 **¡RIVER REPARTIDO!** 🃏\nQuinta carta comunitaria."
+        
+    elif current_round == 'river':
+        # Showdown: determinar ganador
+        new_round = 'showdown'
+        
+        # Simular ganador (por ahora aleatorio)
+        ganador_id = random.choice(players)
+        
+        c.execute("SELECT username FROM users WHERE user_id=?", (int(ganador_id),))
+        ganador_nombre = c.fetchone()[0] if c.fetchone() else "Jugador"
+        
+        c.execute("SELECT pot FROM game_rooms WHERE room_id=?", (room_id,))
+        pot = c.fetchone()[0]
+        
+        # Dar fichas al ganador
+        c.execute("UPDATE users SET chips = chips + ? WHERE user_id=?", (pot, ganador_id))
+        
+        mensaje = f"🏆 **¡SHOWDOWN!** 🏆\n\n🎉 **{ganador_nombre} GANA {pot} FICHAS!** 🎉\n\nEl juego ha terminado."
+        
+        # Resetear sala
+        c.execute("UPDATE game_rooms SET status='waiting', current_players=1, players='', deck='', community_cards='', pot=0, current_bet=0, round='preflop' WHERE room_id=?", (room_id,))
+        
+        # Enviar mensaje final
+        for player_id in players:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(player_id),
+                    text=mensaje
+                )
+            except:
+                pass
+        
+        conn.commit()
+        conn.close()
+        return
+    
+    else:
+        conn.close()
+        return
+    
+    # Actualizar base de datos
+    deck_str = ','.join(deck)
+    c.execute("UPDATE game_rooms SET round=?, deck=?, community_cards=?, current_bet=0 WHERE room_id=?", 
+             (new_round, deck_str, community_cards, room_id))
+    
+    # Resetear turno al primer jugador
+    if players:
+        c.execute("UPDATE game_rooms SET current_turn=? WHERE room_id=?", (players[0], room_id))
+    
+    conn.commit()
+    conn.close()
+    
+    # Mostrar mesa actualizada
+    await mostrar_mesa(room_id, context, mensaje)
+    
+    # Si es showdown, ya terminamos
+    if new_round != 'showdown':
+        # Esperar 3 segundos antes de siguiente acción
+        await asyncio.sleep(3)
+
 # Repartir cartas automáticamente
 async def iniciar_juego_automatico(room_id, context):
     conn = sqlite3.connect('poker.db')
     c = conn.cursor()
     
     # Obtener jugadores
-    c.execute("SELECT players FROM game_rooms WHERE room_id=?", (room_id,))
-    players_str = c.fetchone()[0]
+    c.execute("SELECT players, player_names FROM game_rooms WHERE room_id=?", (room_id,))
+    room = c.fetchone()
+    players_str = room[0] if room else ""
     players = players_str.split(',') if players_str else []
+    player_names = room[1].split(',') if room and room[1] else []
     
     if len(players) >= 2:
         # Mezclar mazo
         deck = DECK.copy()
         random.shuffle(deck)
+        deck_str = ','.join(deck)
         
         # Repartir 2 cartas a cada jugador
-        manos = {}
         for i, player_id in enumerate(players):
             if i*2+1 < len(deck):
                 mano = [deck[i*2], deck[i*2+1]]
-                manos[int(player_id)] = mano
-        
+                
                 # Enviar cartas por privado
                 try:
+                    player_name = player_names[i] if i < len(player_names) else "Jugador"
                     await context.bot.send_message(
                         chat_id=int(player_id),
-                        text=f"🃏 **TUS CARTAS:**\n{mano[0]} {mano[1]}\n\n"
-                             f"¡El juego ha comenzado! Espera tu turno para apostar."
+                        text=f"🎴 **TUS CARTAS PRIVADAS** 🎴\n\n"
+                             f"🃏 {mano[0]}  🃏 {mano[1]}\n\n"
+                             f"¡Buena suerte {player_name}! El juego ha comenzado."
                     )
                 except:
                     pass
         
-        # Guardar estado
-        deck_str = ','.join(deck[4:])  # Quitar cartas repartidas
-        c.execute("UPDATE game_rooms SET status='playing', deck=?, pot=50, current_turn=? WHERE room_id=?",
-                 (deck_str, players[0], room_id))
+        # Configurar apuestas iniciales (ciegas)
+        pot = 30  # 10 + 20 ciegas
+        current_bet = 20
         
-        # Mensaje en grupo (si hay chat_id de grupo)
-        for player_id in players:
-            try:
-                keyboard = [
-                    [InlineKeyboardButton("✅ Ver", callback_data=f"ver_{room_id}"),
-                     InlineKeyboardButton("📤 Apostar 10", callback_data=f"apostar_{room_id}_10"),
-                     InlineKeyboardButton("📤 Apostar 50", callback_data=f"apostar_{room_id}_50")],
-                    [InlineKeyboardButton("🔄 Pasar", callback_data=f"pasar_{room_id}"),
-                     InlineKeyboardButton("🏳️ Retirarse", callback_data=f"retirarse_{room_id}")]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await context.bot.send_message(
-                    chat_id=int(player_id),
-                    text="🎰 **MESA DE POKER** 🎰\n\n"
-                         "¡Juego iniciado! Bote: 50 fichas\n"
-                         "Es el turno del primer jugador.\n"
-                         "Usa los botones para jugar:",
-                    reply_markup=reply_markup
-                )
-            except:
-                pass
+        # Guardar estado
+        c.execute("UPDATE game_rooms SET status='playing', deck=?, pot=?, current_bet=?, current_turn=?, round='preflop' WHERE room_id=?",
+                 (deck_str[6:], pot, current_bet, players[1], room_id))  # El jugador 2 (big blind) habla primero
+        
+        # Mostrar mesa inicial
+        await mostrar_mesa(room_id, context, "💰 **Apuestas iniciales:** 10/20 ciegas\nEs el turno del Big Blind.")
         
         conn.commit()
     
@@ -167,14 +343,22 @@ async def unirse(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_players = room[3] + 1
         
         # Obtener jugadores actuales
-        c.execute("SELECT players FROM game_rooms WHERE room_id=?", (room_id,))
-        players_str = c.fetchone()[0] or ""
-        players_list = players_str.split(',') if players_str else []
-        players_list.append(str(user_id))
-        new_players_str = ','.join(players_list)
+        c.execute("SELECT players, player_names FROM game_rooms WHERE room_id=?", (room_id,))
+        room_data = c.fetchone()
+        players_str = room_data[0] or ""
+        player_names_str = room_data[1] or ""
         
-        c.execute("UPDATE game_rooms SET current_players=?, players=? WHERE room_id=?",
-                 (current_players, new_players_str, room_id))
+        players_list = players_str.split(',') if players_str else []
+        player_names_list = player_names_str.split(',') if player_names_str else []
+        
+        players_list.append(str(user_id))
+        player_names_list.append(username)
+        
+        new_players_str = ','.join(players_list)
+        new_player_names_str = ','.join(player_names_list)
+        
+        c.execute("UPDATE game_rooms SET current_players=?, players=?, player_names=? WHERE room_id=?",
+                 (current_players, new_players_str, new_player_names_str, room_id))
         
         await update.message.reply_text(
             f"✅ ¡{username} se unió a la sala {room_id}!\n"
@@ -190,7 +374,6 @@ async def unirse(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             
             # Esperar y iniciar
-            import asyncio
             await asyncio.sleep(3)
             await iniciar_juego_automatico(room_id, context)
         else:
@@ -209,14 +392,18 @@ async def crear_sala(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Verificar registro
     c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    if not c.fetchone():
+    user = c.fetchone()
+    
+    if not user:
         await update.message.reply_text("❌ Debes registrarte primero con /registro_test [nombre]")
         conn.close()
         return
     
+    username = user[1]
+    
     # Crear sala
-    c.execute("INSERT INTO game_rooms (creator_id, players) VALUES (?, ?)", 
-             (user_id, str(user_id)))
+    c.execute("INSERT INTO game_rooms (creator_id, players, player_names) VALUES (?, ?, ?)", 
+             (user_id, str(user_id), username))
     conn.commit()
     
     c.execute("SELECT last_insert_rowid()")
@@ -273,38 +460,116 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     data = query.data
+    user_id = query.from_user.id
     
     if data.startswith('ver_'):
         room_id = data.split('_')[1]
-        await query.edit_message_text(
-            text="📋 **ESTADO DE LA MESA**\n\n"
-                 "Esperando acciones de los jugadores...\n"
-                 "Usa los botones para apostar o pasar."
-        )
+        
+        conn = sqlite3.connect('poker.db')
+        c = conn.cursor()
+        
+        c.execute("SELECT community_cards, pot, round FROM game_rooms WHERE room_id=?", (room_id,))
+        room = c.fetchone()
+        
+        if room:
+            community_cards = room[0] or "---"
+            pot = room[1]
+            round_name = room[2]
+            
+            await query.edit_message_text(
+                text=f"🔍 **VISIÓN ACTUAL**\n\n"
+                     f"Ronda: {round_name}\n"
+                     f"Bote: {pot} fichas\n"
+                     f"Cartas comunitarias: {community_cards}"
+            )
+        
+        conn.close()
     
     elif data.startswith('apostar_'):
         parts = data.split('_')
         room_id = parts[1]
         cantidad = int(parts[2])
         
+        conn = sqlite3.connect('poker.db')
+        c = conn.cursor()
+        
+        # Actualizar bote
+        c.execute("SELECT pot FROM game_rooms WHERE room_id=?", (room_id,))
+        pot_actual = c.fetchone()[0]
+        nuevo_pot = pot_actual + cantidad
+        
+        c.execute("UPDATE game_rooms SET pot=? WHERE room_id=?", (nuevo_pot, room_id))
+        
+        # Verificar si ambos han apostado en esta ronda
+        c.execute("SELECT players, round FROM game_rooms WHERE room_id=?", (room_id,))
+        room = c.fetchone()
+        players = room[0].split(',') if room[0] else []
+        current_round = room[1]
+        
         await query.edit_message_text(
             text=f"✅ Apostaste {cantidad} fichas!\n"
-                 f"Esperando al otro jugador..."
+                 f"Bote actual: {nuevo_pot} fichas\n\n"
+                 f"Esperando siguiente acción..."
         )
+        
+        conn.commit()
+        conn.close()
+        
+        # Esperar y avanzar ronda
+        await asyncio.sleep(2)
+        await avanzar_ronda(room_id, context)
     
     elif data.startswith('pasar_'):
         room_id = data.split('_')[1]
+        
         await query.edit_message_text(
             text="🔄 Pasaste tu turno!\n"
                  "Esperando al otro jugador..."
         )
+        
+        # Esperar y avanzar
+        await asyncio.sleep(2)
+        await avanzar_ronda(room_id, context)
     
     elif data.startswith('retirarse_'):
         room_id = data.split('_')[1]
-        await query.edit_message_text(
-            text="🏳️ Te retiraste de la mano.\n"
-                 "El otro jugador gana el bote."
-        )
+        
+        conn = sqlite3.connect('poker.db')
+        c = conn.cursor()
+        
+        # Obtener jugadores
+        c.execute("SELECT players, player_names FROM game_rooms WHERE room_id=?", (room_id,))
+        room = c.fetchone()
+        players = room[0].split(',') if room[0] else []
+        player_names = room[1].split(',') if room[1] else []
+        
+        # Encontrar oponente
+        oponente_id = None
+        oponente_nombre = None
+        for i, player_id in enumerate(players):
+            if int(player_id) != user_id:
+                oponente_id = player_id
+                if i < len(player_names):
+                    oponente_nombre = player_names[i]
+        
+        # Dar bote al oponente
+        c.execute("SELECT pot FROM game_rooms WHERE room_id=?", (room_id,))
+        pot = c.fetchone()[0]
+        
+        if oponente_id:
+            c.execute("UPDATE users SET chips = chips + ? WHERE user_id=?", (pot, oponente_id))
+        
+        # Resetear sala
+        c.execute("UPDATE game_rooms SET status='waiting', current_players=1, players='', deck='', community_cards='', pot=0, current_bet=0, round='preflop' WHERE room_id=?", (room_id,))
+        
+        conn.commit()
+        conn.close()
+        
+        mensaje = f"🏳️ Te retiraste de la mano.\n"
+        if oponente_nombre:
+            mensaje += f"🏆 **{oponente_nombre} gana {pot} fichas!**"
+        
+        await query.edit_message_text(text=mensaje)
 
 def main():
     # Inicializar base de datos
@@ -317,20 +582,4 @@ def main():
         return
     
     # Crear aplicación
-    application = Application.builder().token(TOKEN).build()
-    
-    # Añadir handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("registro_test", registro_test))
-    application.add_handler(CommandHandler("unirse", unirse))
-    application.add_handler(CommandHandler("crear_sala", crear_sala))
-    application.add_handler(CommandHandler("salas", salas))
-    application.add_handler(CommandHandler("chips", chips))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    
-    # Iniciar bot
-    logger.info("🤖 Bot de Poker Automático iniciado...")
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+    ap
