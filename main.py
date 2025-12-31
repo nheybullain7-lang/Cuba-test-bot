@@ -898,3 +898,199 @@ def main():
 
 if __name__ == '__main__':
     main()
+# ========== AÑADIR AL FINAL DE main.py ==========
+
+# Diccionario para almacenar juegos activos
+poker_games = {}
+
+@app.route('/api/poker/game_state/<player_id>', methods=['GET'])
+def get_poker_game_state(player_id):
+    # Buscar en qué sala está el jugador
+    for room_id, game in rooms.items():
+        for player in game.get('players', []):
+            if player.get('id') == player_id:
+                # Determinar si es el turno del jugador
+                current_turn_player = game.get('current_turn_player', '')
+                player_turn = current_turn_player == player_id
+                
+                # Obtener información de apuestas
+                current_bet = game.get('current_bet', 0)
+                min_bet = game.get('min_bet', 20)
+                player_chips = player.get('chips', 1000)
+                pot = game.get('pot', 0)
+                
+                # Calcular acciones disponibles
+                player_bet = player.get('current_bet', 0)
+                can_check = player_bet == current_bet
+                can_call = current_bet > player_bet and player_chips >= (current_bet - player_bet)
+                can_raise = player_chips > current_bet
+                can_bet = current_bet == 0 and player_chips > 0
+                
+                return jsonify({
+                    'playerTurn': player_turn,
+                    'canFold': True,
+                    'canCheck': can_check,
+                    'canCall': can_call,
+                    'canRaise': can_raise,
+                    'canBet': can_bet,
+                    'currentBet': current_bet,
+                    'minBet': min_bet,
+                    'playerChips': player_chips,
+                    'pot': pot,
+                    'currentPlayerName': current_turn_player,
+                    'playersInGame': len([p for p in game.get('players', []) if not p.get('folded', False)])
+                })
+    
+    return jsonify({'error': 'Jugador no encontrado'}), 404
+
+@app.route('/api/poker/fold', methods=['POST'])
+def poker_fold():
+    data = request.json
+    player_id = data.get('playerId')
+    
+    # Buscar jugador y sala
+    for room_id, game in rooms.items():
+        for player in game.get('players', []):
+            if player.get('id') == player_id:
+                player['folded'] = True
+                avanzar_turno(game, player_id)
+                return jsonify({'success': True, 'message': 'Te has retirado'})
+    
+    return jsonify({'error': 'Jugador no encontrado'}), 404
+
+@app.route('/api/poker/check', methods=['POST'])
+def poker_check():
+    data = request.json
+    player_id = data.get('playerId')
+    
+    for room_id, game in rooms.items():
+        for player in game.get('players', []):
+            if player.get('id') == player_id:
+                # Verificar que puede pasar
+                if player.get('current_bet', 0) != game.get('current_bet', 0):
+                    return jsonify({'error': 'No puedes pasar'}), 400
+                
+                avanzar_turno(game, player_id)
+                return jsonify({'success': True, 'message': 'Has pasado'})
+    
+    return jsonify({'error': 'Jugador no encontrado'}), 404
+
+@app.route('/api/poker/call', methods=['POST'])
+def poker_call():
+    data = request.json
+    player_id = data.get('playerId')
+    
+    for room_id, game in rooms.items():
+        for player in game.get('players', []):
+            if player.get('id') == player_id:
+                current_bet = game.get('current_bet', 0)
+                player_bet = player.get('current_bet', 0)
+                call_amount = current_bet - player_bet
+                player_chips = player.get('chips', 1000)
+                
+                if call_amount > player_chips:
+                    return jsonify({'error': 'Fichas insuficientes'}), 400
+                
+                player['chips'] -= call_amount
+                player['current_bet'] = current_bet
+                game['pot'] = game.get('pot', 0) + call_amount
+                
+                avanzar_turno(game, player_id)
+                return jsonify({'success': True, 'message': f'Has igualado {call_amount} fichas'})
+    
+    return jsonify({'error': 'Jugador no encontrado'}), 404
+
+@app.route('/api/poker/raise', methods=['POST'])
+def poker_raise():
+    data = request.json
+    player_id = data.get('playerId')
+    amount = data.get('amount', 0)
+    
+    if amount <= 0:
+        return jsonify({'error': 'Cantidad inválida'}), 400
+    
+    for room_id, game in rooms.items():
+        for player in game.get('players', []):
+            if player.get('id') == player_id:
+                current_bet = game.get('current_bet', 0)
+                min_bet = game.get('min_bet', 20)
+                player_chips = player.get('chips', 1000)
+                
+                if amount < min_bet:
+                    return jsonify({'error': f'Apuesta mínima: {min_bet}'}), 400
+                
+                if amount > player_chips:
+                    return jsonify({'error': 'Fichas insuficientes'}), 400
+                
+                total_bet = player.get('current_bet', 0) + amount
+                
+                player['chips'] -= amount
+                player['current_bet'] = total_bet
+                game['current_bet'] = total_bet
+                game['pot'] = game.get('pot', 0) + amount
+                game['min_bet'] = amount
+                
+                avanzar_turno(game, player_id)
+                return jsonify({'success': True, 'message': f'Has subido {amount} fichas'})
+    
+    return jsonify({'error': 'Jugador no encontrado'}), 404
+
+@app.route('/api/poker/bet', methods=['POST'])
+def poker_bet():
+    data = request.json
+    player_id = data.get('playerId')
+    amount = data.get('amount', 0)
+    
+    if amount <= 0:
+        return jsonify({'error': 'Cantidad inválida'}), 400
+    
+    for room_id, game in rooms.items():
+        for player in game.get('players', []):
+            if player.get('id') == player_id:
+                min_bet = game.get('min_bet', 20)
+                player_chips = player.get('chips', 1000)
+                
+                if amount < min_bet:
+                    return jsonify({'error': f'Apuesta mínima: {min_bet}'}), 400
+                
+                if amount > player_chips:
+                    return jsonify({'error': 'Fichas insuficientes'}), 400
+                
+                player['chips'] -= amount
+                player['current_bet'] = amount
+                game['current_bet'] = amount
+                game['pot'] = game.get('pot', 0) + amount
+                game['min_bet'] = amount
+                
+                avanzar_turno(game, player_id)
+                return jsonify({'success': True, 'message': f'Has apostado {amount} fichas'})
+    
+    return jsonify({'error': 'Jugador no encontrado'}), 404
+
+# Función auxiliar para avanzar turno
+def avanzar_turno(game, current_player_id):
+    players = game.get('players', [])
+    if not players:
+        return
+    
+    # Encontrar índice del jugador actual
+    current_index = -1
+    for i, player in enumerate(players):
+        if player.get('id') == current_player_id:
+            current_index = i
+            break
+    
+    if current_index == -1:
+        return
+    
+    # Buscar siguiente jugador no retirado
+    next_index = (current_index + 1) % len(players)
+    attempts = 0
+    
+    while attempts < len(players):
+        player = players[next_index]
+        if not player.get('folded', False):
+            game['current_turn_player'] = player.get('id')
+            break
+        next_index = (next_index + 1) % len(players)
+        attempts += 1
